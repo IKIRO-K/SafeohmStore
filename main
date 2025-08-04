@@ -1,0 +1,1136 @@
+--[[ SafeohmStore(CustomProfileService)
+made by light_ohm(@fffuuurrryyytttvvv)
+
+-- Version
+
+현재 버전: 2.0
+
+1.0.0 출시
+1.0.1 버그 수정
+1.1 최적화 및 안정성 개선
+1.2 최적화 및 안정성 개선
+1.2.1 버그 가능성 수정
+1.2.2 버그 수정 및 최적화
+1.2.3 로그(log) 수정
+2.0 최적화 및 안정성 개선, 새로운 기능 추가
+
+]]
+
+local DS = game:GetService("DataStoreService")
+local RS = game:GetService("RunService")
+local HS = game:GetService("HttpService")
+local Players = game:GetService("Players")
+
+local CFG = {
+	AutoSaveInterval = 60,         -- 프로필 자동 저장 간격
+	AutoSaveBatchSize = 30,        -- 한 번에 자동 저장할 최대 프로필 수
+	MaxRetries = 10,               -- 저장 실패 시 재시도 횟수
+	RetryDelayBase = 1.5,          -- 재시도 간 기본 대기 시간(초)
+	RetryDelayMultiplier = 1.5,    -- 재시도 대기 시간 누적 배수
+	SessionLockCheckInterval = 0.1,-- 세션락 체크 폴링 간격
+	SessionLockExpiration = 180,   -- 세션락 만료 시간(초)
+	ForceLoadWaitCycles = 1,       -- 세션충돌 시 대기 반복 횟수
+	DebugMode = false,              -- 디버깅 모드
+	ERR_FORCELOAD_TIMEOUT = "ForceLoadTimeout",
+	ERR_STEAL_FAILED = "StealFailed",
+	ERR_INITIAL_LOCK_SAVE_FAILED = "InitialLockSaveFailed",
+	BackupSuffix = "_backup",      -- 백업 데이터 저장 키 접미사
+	BackupMaxRetries = 3,          -- 백업 저장 실패 시 최대 재시도 횟수
+	MinProfileKeyLen = 3,          -- 프로필 키 최소 길이
+	MaxProfileKeyLen = 50,         -- 프로필 키 최대 길이
+	PendingLoadTimeout = 30,       -- LoadProfileAsync 대기 타임아웃(초)
+	MaxHistorySize = 100,          -- GlobalUpdates History 최대 크기
+	LockTimeout = 5,               -- Lock Acquire 타임아웃(초)
+}
+
+local function log(...)
+	if CFG.DebugMode then
+		print("[CPS]:", ...)
+	end
+end
+
+local function warn(...)
+	if CFG.DebugMode then
+		warn("[CPS Warning]:", ...)
+	else
+		warn("[CPS Warning]:", select(1, ...))
+	end
+end
+
+local function deepCopy(t)
+	if type(t) ~= "table" then return t end
+	local c = {}
+	local stack = {{src = t, tgt = c}}
+	while #stack > 0 do
+		local current = table.remove(stack)
+		for k, v in pairs(current.src) do
+			if type(v) == "table" then
+				local newT = {}
+				current.tgt[k] = newT
+				table.insert(stack, {src = v, tgt = newT})
+			else
+				current.tgt[k] = v
+			end
+		end
+	end
+	return c
+end
+
+local function mergeDefaults(target, defaults)
+	if type(target) ~= "table" or type(defaults) ~= "table" then 
+		return false 
+	end
+	local changed = false
+	for k, v in pairs(defaults) do
+		if target[k] == nil then
+			target[k] = type(v) == "table" and deepCopy(v) or v
+			changed = true
+		elseif type(v) == "table" and type(target[k]) == "table" then
+			if mergeDefaults(target[k], v) then
+				changed = true
+			end
+		end
+	end
+	return changed
+end
+
+local function now() 
+	return os.time() 
+end
+
+local function genSessionId() 
+	return HS:GenerateGUID(false) 
+end
+
+local function sanitizeKey(key)
+	if type(key) ~= "string" then return nil end
+	key = key:match("^%s*(.-)%s*$")
+	if #key < CFG.MinProfileKeyLen or #key > CFG.MaxProfileKeyLen then
+		return nil
+	end
+	if not key:match("^[%w_%-]+$") then return nil end
+	return key
+end
+
+local CRYPT_KEY = "asd12e1YGHUIEd2G1`2vj121dF2dgd8123"
+
+local function xorCrypt(data, key)
+	local out = {}
+	local keyLen = #key
+	for i = 1, #data do
+		local keyChar = key:byte(((i - 1) % keyLen) + 1)
+		local dataChar = data:byte(i)
+		out[i] = string.char(bit32.bxor(dataChar, keyChar))
+	end
+	return table.concat(out)
+end
+
+local function encrypt(data)
+	local json = HS:JSONEncode(data)
+	return xorCrypt(json, CRYPT_KEY)
+end
+
+local function decrypt(data)
+	local ok, decoded = pcall(function()
+		local xored = xorCrypt(data, CRYPT_KEY)
+		return HS:JSONDecode(xored)
+	end)
+	if ok and type(decoded) == "table" then
+		return decoded
+	end
+
+	local fallbackOk, fb = pcall(HS.JSONDecode, HS, data)
+	if fallbackOk and type(fb) == "table" then
+		warn("Decrypt fallback to plain JSON succeeded")
+		return fb
+	end
+
+	warn("Decrypt failed completely - data loss risk")
+	return nil
+end
+
+local Lock = {}
+Lock.__index = Lock
+function Lock.new()
+	local self = setmetatable({}, Lock)
+	self._locked = false
+	self._event = Instance.new("BindableEvent")
+	return self
+end
+function Lock:Acquire(timeout)
+	timeout = timeout or CFG.LockTimeout
+	local start = now()
+	log("Lock acquiring...")
+	while self._locked do
+		if now() - start > timeout then
+			warn("Lock acquire timeout")
+			error("LockAcquireTimeout")
+		end
+		log("Lock held, waiting...")
+		self._event.Event:Wait()
+	end
+	self._locked = true
+	log("Lock acquired.")
+end
+function Lock:Release()
+	log("Releasing lock...")
+	self._locked = false
+	self._event:Fire()
+end
+
+local PQ = {}
+PQ.__index = PQ
+function PQ.new()
+	local self = setmetatable({}, PQ)
+	self._heap = {}
+	self._times = {}
+	self._totalWait = 0
+	return self
+end
+function PQ:_swap(i, j)
+	self._heap[i], self._heap[j] = self._heap[j], self._heap[i]
+	self._times[i], self._times[j] = self._times[j], self._times[i]
+end
+function PQ:_up(idx)
+	if idx <= 1 then return end
+	local p = math.floor(idx / 2)
+	if self._heap[idx].Priority < self._heap[p].Priority then
+		self:_swap(idx, p)
+		self:_up(p)
+	end
+end
+function PQ:_down(idx)
+	local sz = #self._heap
+	local l = idx * 2
+	local r = idx * 2 + 1
+	local min = idx
+	if l <= sz and self._heap[l].Priority < self._heap[min].Priority then
+		min = l
+	end
+	if r <= sz and self._heap[r].Priority < self._heap[min].Priority then
+		min = r
+	end
+	if min ~= idx then
+		self:_swap(idx, min)
+		self:_down(min)
+	end
+end
+function PQ:Push(item)
+	table.insert(self._heap, item)
+	table.insert(self._times, now())
+	log("PQ: Pushed Priority =", item.Priority)
+	self:_up(#self._heap)
+end
+function PQ:Pop()
+	if #self._heap == 0 then return nil end
+	local root = self._heap[1]
+	local insertTime = self._times[1] or now()
+	local waitTime = now() - insertTime
+	self._totalWait = self._totalWait + waitTime
+	log("PQ: Popped (wait:", waitTime, "s)")
+	table.remove(self._heap, 1)
+	table.remove(self._times, 1)
+	if #self._heap > 0 then 
+		self:_down(1)
+	end
+	return root
+end
+function PQ:IsEmpty()
+	return #self._heap == 0
+end
+function PQ:GetMetrics()
+	local cnt = #self._heap
+	local avg = cnt > 0 and self._totalWait / cnt or 0
+	return { Count = cnt, TotalWaitTime = self._totalWait, AvgWaitTime = avg }
+end
+
+local Sig = {}
+Sig.__index = Sig
+function Sig.new()
+	return setmetatable({ _conns = {}, _queued = {}, _firing = false }, Sig)
+end
+function Sig:Connect(cb)
+	assert(type(cb) == "function", "callback must be function")
+	local conn = { Callback = cb, Connected = true, _signal = self }
+	table.insert(self._conns, conn)
+	return {
+		Disconnect = function()
+			if conn.Connected then
+				conn.Connected = false
+				conn._marked = true
+			end
+		end
+	}
+end
+function Sig:_cleanup()
+	local clean = {}
+	for _, conn in ipairs(self._conns) do
+		if not conn._marked then 
+			table.insert(clean, conn) 
+		end
+	end
+	self._conns = clean
+end
+function Sig:Fire(...)
+	if self._firing then
+		table.insert(self._queued, {...})
+		return
+	end
+	self._firing = true
+	local args = table.pack(...)
+	for _, conn in ipairs(self._conns) do
+		if conn.Connected and not conn._marked then
+			local ok, err = pcall(conn.Callback, table.unpack(args, 1, args.n))
+			if not ok then 
+				warn("Sig callback error:", err) 
+			end
+		end
+	end
+	self._firing = false
+	if #self._queued > 0 then
+		local nextArgs = table.remove(self._queued, 1)
+		self:Fire(table.unpack(nextArgs))
+	end
+end
+function Sig:Wait()
+	local thread = coroutine.running()
+	local conn
+	conn = self:Connect(function(...)
+		if conn then conn:Disconnect() end
+		task.defer(coroutine.resume, thread, ...)
+	end)
+	return coroutine.yield()
+end
+function Sig:Destroy()
+	for _, conn in ipairs(self._conns) do 
+		conn.Connected = false 
+	end
+	self._conns = {}
+	self._queued = {}
+end
+
+-- 글로벌 업데이트 관리
+local GU = {}
+GU.__index = GU
+function GU.new(profile, data)
+	local self = setmetatable({}, GU)
+	self._profile = profile
+	self._data = data or { Index = 0, History = {}, Active = {} }
+	self.OnActiveUpdateAdded = Sig.new()
+	self.OnUpdateLocked = Sig.new()
+	self.OnUpdateCleared = Sig.new()
+	return self
+end
+function GU:GetActiveUpdates()
+	local copy = {}
+	for id, upd in pairs(self._data.Active) do
+		copy[id] = upd
+	end
+	return copy
+end
+function GU:AddActiveUpdate(id, data)
+	assert(type(id) == "string" or type(id) == "number", "Invalid update id")
+	self._data.Active[id] = deepCopy(data)
+	self._data.History[id] = { Added = now(), Data = deepCopy(data), Locked = false }
+
+	local historyKeys = {}
+	for k in pairs(self._data.History) do
+		table.insert(historyKeys, k)
+	end
+	if #historyKeys > CFG.MaxHistorySize then
+		table.sort(historyKeys, function(a, b)
+			return self._data.History[a].Added < self._data.History[b].Added
+		end)
+		local toRemove = table.remove(historyKeys, 1)
+		self._data.History[toRemove] = nil
+		log("GU: History cleaned, removed old ID:", toRemove)
+	end
+
+	self.OnActiveUpdateAdded:Fire(id, data)
+	self._profile:_markDirty()
+end
+function GU:LockUpdate(id)
+	if not self._data.Active[id] then
+		warn("GU: LockUpdate - ID not found:", id)
+		return false
+	end
+	self._data.History[id].Locked = true
+	self._data.History[id].LockedTime = now()
+	self._data.Active[id] = nil
+	self.OnUpdateLocked:Fire(id)
+	self._profile:_markDirty()
+	return true
+end
+function GU:_Serialize()
+	return self._data
+end
+
+local Profile = {}
+Profile.__index = Profile
+
+local function ensureDef(prof)
+	if type(prof.Data) ~= "table" then prof.Data = {} end
+	if type(prof.Data.Stats) ~= "table" then prof.Data.Stats = {} end
+	if prof.Data.Stats.Level == nil then
+		prof.Data.Stats.Level = 1
+		log(prof:Id(), "- default Level(1) set")
+	end
+	if prof.Data.Stats.Coins == nil then
+		prof.Data.Stats.Coins = 0
+		log(prof:Id(), "- default Coins(0) set")
+	end
+end
+
+function Profile._new(key, store, data, view)
+	local k = sanitizeKey(key)
+	assert(k, "Key sanitation failed")
+
+	local self = setmetatable({}, Profile)
+	self.Key = k
+	self._store = store
+	self._active = not view
+	self._view = view
+	self._relSig = Sig.new()
+	self._metaSig = Sig.new()
+	self._dirty = false
+	self._saveLock = Lock.new()
+	self._saving = false
+
+	if data then
+		local dec = decrypt(data.Data or HS:JSONEncode(deepCopy(store.DefaultData)))
+		self.Data = dec or deepCopy(store.DefaultData)
+		self.MetaData = data.MetaData or {}
+		self.GlobalUpdates = GU.new(self, data.GlobalUpdates)
+	else
+		self.Data = deepCopy(store.DefaultData)
+		self.MetaData = {
+			CreateTime = now(),
+			LoadCount = 0,
+			Session = nil,
+			Tags = {},
+			LastSave = 0,
+			Schema = store.SchemaVersion or 1
+		}
+		self.GlobalUpdates = GU.new(self)
+	end
+
+	mergeDefaults(self.MetaData, {
+		CreateTime = now(),
+		LoadCount = 0,
+		Session = nil,
+		Tags = {},
+		LastSave = 0,
+		Schema = store.SchemaVersion or 1
+	})
+
+	self:Reconcile()
+	ensureDef(self)
+	log(self:Id(), "Profile created. View:", view)
+	return self
+end
+
+function Profile:Reconcile()
+	if mergeDefaults(self.Data, self._store.DefaultData) then
+		self:_markDirty()
+	end
+end
+
+function Profile:IsActive()
+	return self._active and not self._view
+end
+
+function Profile:IsView()
+	return self._view
+end
+
+function Profile:Id()
+	return string.format("P[%s:%s]", self._store.StoreName, self.Key)
+end
+
+function Profile:_markDirty()
+	if not self._view and not self._dirty then
+		log(self:Id(), "marked dirty")
+		self._dirty = true
+	end
+end
+
+function Profile:SetTag(tag, val)
+	assert(type(tag) == "string" and tag ~= "", "Invalid tag")
+	local mt = self.MetaData.Tags or {}
+	if mt[tag] ~= val then
+		mt[tag] = val
+		self.MetaData.Tags = mt
+		self:_markDirty()
+		self._metaSig:Fire(tag, val)
+		log(self:Id(), "tag set:", tag)
+	end
+end
+
+function Profile:GetTag(tag)
+	return self.MetaData.Tags and self.MetaData.Tags[tag]
+end
+
+function Profile:OnRelease(cb)
+	return self._relSig:Connect(cb)
+end
+
+function Profile:OnMetaChange(cb)
+	return self._metaSig:Connect(cb)
+end
+
+function Profile:Save()
+	if self._saving then
+		log(self:Id(), "save in progress, skipping")
+		return false
+	end
+	log(self:Id(), "manual save")
+	task.spawn(function() 
+		self._store:_EnqSave(self, false, 1) 
+	end)
+	return true
+end
+
+function Profile:Release(force)
+	if not self._active then 
+		log(self:Id(), "already released") 
+		return 
+	end
+	log(self:Id(), "releasing...")
+	self._active = false
+	self._relSig:Fire(game.PlaceId, game.JobId)
+
+	if self._dirty or force then
+		task.spawn(function()
+			local ok = self._store:_EnqSave(self, true, 0)
+			if not ok then 
+				warn(self:Id(), "release save failed")
+			end
+			self._store:_FinRelease(self)
+		end)
+	else
+		task.spawn(function() 
+			self._store:_FinRelease(self) 
+		end)
+	end
+end
+
+function Profile:AddCoins(amt)
+	if type(amt) ~= "number" or amt == 0 then return end
+	self.Data.Stats.Coins = (self.Data.Stats.Coins or 0) + amt
+	self:_markDirty()
+	log(self:Id(), "coins added:", amt)
+end
+
+function Profile:SetLevel(lvl)
+	if type(lvl) ~= "number" or lvl < 1 then return end
+	self.Data.Stats.Level = lvl
+	self:_markDirty()
+	log(self:Id(), "level set:", lvl)
+end
+
+function Profile:GetCoins()
+	return self.Data.Stats.Coins or 0
+end
+
+function Profile:GetLevel()
+	return self.Data.Stats.Level or 1
+end
+
+function Profile:CanAfford(cost)
+	return self:GetCoins() >= (cost or 0)
+end
+
+function Profile:Purchase(cost, item)
+	if not self:CanAfford(cost) then
+		return false, "insufficient coins"
+	end
+	self:AddCoins(-cost)
+	if item and type(self.Data.Inventory) == "table" then
+		self.Data.Inventory[item] = (self.Data.Inventory[item] or 0) + 1
+	end
+	log(self:Id(), "purchased:", item, "cost:", cost)
+	return true
+end
+
+function Profile:_Serialize()
+	local ser = { 
+		Data = encrypt(self.Data), 
+		MetaData = self.MetaData, 
+		GlobalUpdates = self.GlobalUpdates:_Serialize() 
+	}
+	return ser
+end
+
+local PS = {}
+PS.__index = PS
+
+function PS._new(svc, name, def, scope, ver)
+	assert(type(name) == "string" and name ~= "", "storeName must be non-empty")
+	local self = setmetatable({}, PS)
+	self.ServiceName = svc.ServiceName or "CPS"
+	self.StoreName = name
+	self.Scope = scope or "global"
+	self.DefaultData = def
+	self.SchemaVersion = ver or 1
+	self._svc = svc
+
+	log("PS: Init DataStore", name, scope)
+	local ok, ds = pcall(function() 
+		return DS:GetDataStore(self.StoreName, self.Scope) 
+	end)
+	if not ok then
+		warn("DataStore init fail", self.StoreName, self.Scope, ds)
+		svc.CriticalStateSignal:Fire("GetDataStoreFailed", ds, self.StoreName, self.Scope)
+		error("Failed init PS")
+	end
+
+	self.DataStore = ds
+	self.LoadedProfiles = {}
+	self._pendLoads = {}
+	self._pendLock = Lock.new()
+	self._profPlayerMap = setmetatable({}, {__mode="kv"})
+
+	self.IssueSignal = Sig.new()
+	self.ProfileLoaded = Sig.new()
+	self.ProfileLoadFailed = Sig.new()
+	self.ProfileSaved = Sig.new()
+	self.ProfileSaveFailed = Sig.new()
+	self.ProfileReleased = Sig.new()
+
+	self._saveQ = PQ.new()
+	self._saveQLock = Lock.new()
+	self._autoList = {}
+	self._autoLock = Lock.new()
+	self._lastAutoTime = now()
+	self._autoCoro = nil
+	self._procSaveQ = false
+
+	self:_StartAutoLoop()
+	log("PS created:", self.StoreName, self.Scope)
+	return self
+end
+
+function PS:_CallDS(method, key, ...)
+	local args = {...}
+	local retries = 0
+	local dsMethod = self.DataStore[method]
+	if not dsMethod then
+		local err = "Invalid DS method: " .. tostring(method)
+		warn(err)
+		self.IssueSignal:Fire("InvalidDSMethod", method, self.StoreName, key)
+		return false, err
+	end
+
+	while retries < CFG.MaxRetries do
+		log("Calling", method, "for", key, "attempt:", retries+1)
+		local ok, res = pcall(dsMethod, self.DataStore, key, table.unpack(args))
+		if ok then
+			log(method, "ok for", key, "after", retries, "retries")
+			return true, res
+		else
+			retries = retries + 1
+			local errMsg = string.format("%s failed %s retry %d/%d", method, key, retries, CFG.MaxRetries)
+			warn(errMsg)
+			self.IssueSignal:Fire(method.."Failed", errMsg, self.StoreName, key)
+			if retries >= CFG.MaxRetries then 
+				warn("Max retries for", key)
+				return false, errMsg 
+			end
+			local wait = CFG.RetryDelayBase * (CFG.RetryDelayMultiplier ^ (retries - 1))
+			log("Wait", wait, "sec before retry")
+			task.wait(wait)
+		end
+	end
+	return false, "Max retries exceeded"
+end
+
+function PS:GetLoadedProfile(key)
+	return self.LoadedProfiles[key]
+end
+
+function PS:GetProfileFromPlayer(plr)
+	for prof, p in pairs(self._profPlayerMap) do
+		if p == plr then 
+			return prof 
+		end
+	end
+	return nil
+end
+
+function PS:LoadProfileAsync(key, handler, plr)
+	local k = sanitizeKey(key)
+	assert(k, "Key sanitation failed")
+	assert(handler == "Steal" or handler == "ForceLoad" or handler == "Cancel", "Invalid handler: must be Steal, ForceLoad, or Cancel") -- 핸들러 명시적 요구 (추가)
+	log("LoadProfileAsync", k, "handler:", handler)
+
+	if self.LoadedProfiles[k] then
+		log("Profile already loaded:", k)
+		local prof = self.LoadedProfiles[k]
+		if plr then 
+			self._profPlayerMap[prof] = plr 
+		end
+		self.ProfileLoaded:Fire(prof)
+		return prof
+	end
+
+	self._pendLock:Acquire()
+	if self._pendLoads[k] then
+		log("Load pending for", k, "waiting")
+		self._pendLock:Release()
+		local start = now()
+		while self._pendLoads[k] do 
+			if now() - start > CFG.PendingLoadTimeout then
+				warn("Pending load timeout for", k)
+				return nil
+			end
+			task.wait(0.05)
+		end
+		return self.LoadedProfiles[k]
+	end
+	self._pendLoads[k] = true
+	self._pendLock:Release()
+
+	local ok, data = self:_CallDS("GetAsync", k)
+	if not ok then
+		warn("LoadProfileAsync: GetAsync failed", k)
+		self._pendLock:Acquire()
+		self._pendLoads[k] = nil
+		self._pendLock:Release()
+		self.ProfileLoadFailed:Fire(k, "GetAsyncFailed")
+		return nil
+	end
+	data = data or {}
+
+	local lockRes, prof = self:_HandleLock(k, data.MetaData or {}, handler, data)
+	if lockRes == "Success" and prof then
+		self.LoadedProfiles[k] = prof
+		self._autoLock:Acquire() 
+		table.insert(self._autoList, prof)
+		self._autoLock:Release()
+		if plr then 
+			self._profPlayerMap[prof] = plr 
+		end
+		log("Profile loaded ok:", k)
+		self.ProfileLoaded:Fire(prof)
+		self._pendLock:Acquire()
+		self._pendLoads[k] = nil
+		self._pendLock:Release()
+		return prof
+	else
+		warn("LoadProfileAsync failed", k, "reason:", lockRes)
+		self._pendLock:Acquire()
+		self._pendLoads[k] = nil
+		self._pendLock:Release()
+		self.ProfileLoadFailed:Fire(k, lockRes)
+		if prof and not prof:IsActive() then 
+			prof:Release() 
+		end
+		return nil
+	end
+end
+
+function PS:_HandleLock(key, meta, handler, data)
+	local sess = meta.ActiveSession
+	local conf = false
+
+	if sess then
+		local own = (sess.PlaceId == game.PlaceId and sess.JobId == game.JobId)
+		local exp = (now() - (sess.Timestamp or 0)) > CFG.SessionLockExpiration
+		local grace = 30 
+		local rejoin = (not exp) and (not own) and (sess.JobId ~= game.JobId) 
+			and ((now() - (sess.Timestamp or 0)) <= grace)
+		local age = now() - (sess.Timestamp or 0)
+		local stale = age > (CFG.SessionLockExpiration / 2)
+
+		log("Session check", key, "Age:", age, "Own:", own, "Exp:", exp, "Rejoin:", rejoin, "Stale:", stale)
+
+		if not own and not exp and not rejoin and not stale then
+			conf = true
+		end
+	end
+
+	if conf then
+		if handler == "Cancel" then
+			log("Cancel handler, aborting load", key)
+			return "Cancelled", nil
+		elseif handler == "Steal" then
+			warn("Steal: stealing session", key)
+			local prof = Profile._new(key, self, data, false)
+			prof.MetaData.SessionLoadCount = (meta.SessionLoadCount or 0) + 1
+			prof.MetaData.ActiveSession = {
+				PlaceId = game.PlaceId,
+				JobId = game.JobId,
+				Timestamp = now(),
+				SessionId = genSessionId()
+			}
+			if self:_EnqSave(prof, true, 0) then
+				return "Success", prof
+			else
+				prof:Release()
+				return "StealFailed", nil
+			end
+
+		elseif handler == "ForceLoad" then
+			log("ForceLoad", key)
+			local ok, fresh = self:_CallDS("GetAsync", key)
+			if ok and fresh then
+				data = fresh
+				meta = fresh.MetaData or {}
+				local latest = meta.ActiveSession
+				if latest then
+					local lAge = now() - (latest.Timestamp or 0)
+					local lOwn = (latest.PlaceId == game.PlaceId and latest.JobId == game.JobId)
+					local lExp = lAge > CFG.SessionLockExpiration
+					log("Latest check Age:", lAge, "Own:", lOwn, "Exp:", lExp)
+					if not lOwn and not lExp and lAge > 30 then
+						log("Confirmed conflict, ForceLoad")
+					else
+						log("Conflict resolved, normal load")
+					end
+				end
+			else
+				warn("ForceLoad GetAsync failed", key)
+			end
+
+			local prof = Profile._new(key, self, data, false)
+			prof.MetaData.SessionLoadCount = (meta.SessionLoadCount or 0) + 1
+			prof.MetaData.ActiveSession = {
+				PlaceId = game.PlaceId,
+				JobId = game.JobId,
+				Timestamp = now(),
+				SessionId = genSessionId()
+			}
+			if self:_EnqSave(prof, true, 0) then
+				return "Success", prof
+			else
+				prof:Release()
+				return "ForceLoadSaveFailed", nil
+			end
+		else
+			error("Unknown handler: " .. tostring(handler) .. " - must specify valid handler") -- fallback 제거, 에러 throw (수정)
+		end
+	else
+		local prof = Profile._new(key, self, data, false)
+		prof.MetaData.SessionLoadCount = (meta.SessionLoadCount or 0) + 1
+		prof.MetaData.ActiveSession = {
+			PlaceId = game.PlaceId,
+			JobId = game.JobId,
+			Timestamp = now(),
+			SessionId = genSessionId()
+		}
+		if self:_EnqSave(prof, true, 0) then
+			return "Success", prof
+		else
+			prof:Release()
+			return CFG.ERR_INITIAL_LOCK_SAVE_FAILED, nil
+		end
+	end
+end
+
+function PS:ViewProfileAsync(key, ver)
+	local k = sanitizeKey(key)
+	assert(k, "Key sanitation failed")
+	log("ViewProfileAsync", k, "ver:", ver)
+	if self.LoadedProfiles[k] and self.LoadedProfiles[k]:IsActive() then
+		self.IssueSignal:Fire("ViewActiveError", "Profile active", self.StoreName, k)
+		return nil
+	end
+	local ok, data
+	if ver then
+		ok, data = false, nil
+	else
+		ok, data = self:_CallDS("GetAsync", k)
+	end
+	if not ok then return nil end
+	return Profile._new(k, self, data, true)
+end
+
+function PS:_BackupProf(prof)
+	local bk = prof.Key .. CFG.BackupSuffix
+	local dat = prof:_Serialize()
+	dat.MetaData.LastBackup = now()
+	log("Backup", prof.Key, "to", bk)
+	local tries = 0
+	while tries < CFG.BackupMaxRetries do
+		local ok, err = pcall(function()
+			return self.DataStore:UpdateAsync(bk, function() return dat end)
+		end)
+		if ok then
+			log("Backup ok", prof.Key)
+			return true
+		else
+			tries = tries + 1
+			warn("Backup attempt", tries, "failed", prof.Key, err)
+			task.wait(CFG.RetryDelayBase * (CFG.RetryDelayMultiplier ^ (tries - 1)))
+		end
+	end
+	warn("Backup failed", prof.Key, "after", tries, "attempts")
+	return false
+end
+
+function PS:_EnqSave(prof, rel, pri)
+	pri = pri or 1
+	log("EnqSave", prof:Id(), "Rel:", rel, "Pri:", pri)
+	self._saveQLock:Acquire()
+	self._saveQ:Push({ Profile = prof, ReleaseFlag = rel, Priority = pri })
+	self._saveQLock:Release()
+	task.spawn(function() self:_ProcSaveQ() end)
+	return true
+end
+
+function PS:_ProcSaveQ()
+	if self._procSaveQ then return end
+	self._procSaveQ = true
+	log("Processing save queue")
+	while true do
+		self._saveQLock:Acquire()
+		if self._saveQ:IsEmpty() then
+			log("Queue empty")
+			self._saveQLock:Release()
+			break
+		end
+		local task = self._saveQ:Pop()
+		self._saveQLock:Release()
+
+		local prof = task.Profile
+		local rel = task.ReleaseFlag
+		log("Process save", prof:Id(), "Rel:", rel)
+
+		if prof:IsView() then 
+			warn("Skip view mode save", prof:Id())
+		else
+			prof._saveLock:Acquire()
+			if prof._saving then
+				log(prof:Id(), "save in progress, skip")
+				prof._saveLock:Release()
+			else
+				prof._saving = true
+				prof._saveLock:Release()
+
+				local dat = prof:_Serialize()
+				if rel then
+					dat.MetaData.ActiveSession = nil
+					log("Clear session for release", prof.Key)
+				else
+					if dat.MetaData.ActiveSession then
+						dat.MetaData.ActiveSession.Timestamp = now()
+					else
+						if CFG.DebugMode then
+							warn("Missing session, auto-assign", prof.Key)
+						end
+						dat.MetaData.ActiveSession = { 
+							PlaceId = game.PlaceId, 
+							JobId = game.JobId, 
+							Timestamp = now(), 
+							SessionId = genSessionId() 
+						}
+					end
+				end
+				dat.MetaData.LastSave = now()
+				log("UpdateAsync", prof.Key)
+
+				self:_BackupProf(prof)
+
+				local updateOk, updateErr = false, nil
+				local ok, err = pcall(function()
+					updateOk, updateErr = self.DataStore:UpdateAsync(prof.Key, function() return dat end)
+				end)
+				if not ok then 
+					updateOk = false
+					updateErr = err
+				end
+
+				if updateOk then
+					prof._dirty = false
+					self.ProfileSaved:Fire(prof, rel)
+					log("UpdateAsync ok", prof.Key)
+				else
+					warn("UpdateAsync fail", prof.Key, updateErr)
+					self.ProfileSaveFailed:Fire(prof.Key, updateErr)
+					prof._dirty = true
+				end
+
+				prof._saveLock:Acquire()
+				prof._saving = false
+				prof._saveLock:Release()
+			end
+		end
+	end
+	self._procSaveQ = false
+end
+
+function PS:_StartAutoLoop()
+	if self._autoCoro then return end
+	log("Starting AutoSave loop, interval:", CFG.AutoSaveInterval)
+	self._autoCoro = task.spawn(function()
+		while true do
+			task.wait(math.max(1, CFG.AutoSaveInterval))
+			local batch = {}
+			self._autoLock:Acquire()
+			for i = #self._autoList, 1, -1 do
+				local prof = self._autoList[i]
+				if prof:IsActive() and prof._dirty and not prof._saving then
+					table.insert(batch, prof)
+					if #batch >= CFG.AutoSaveBatchSize then break end
+				end
+			end
+			self._autoLock:Release()
+			if #batch > 0 then
+				log("AutoSave batch:", #batch, "profiles")
+				for _, prof in ipairs(batch) do
+					task.spawn(function()
+						log("AutoSave enq:", prof:Id())
+						self:_EnqSave(prof, false, 1)
+					end)
+					task.wait(0.1) -- 배치 지연 (API 호출 분산, 추가)
+				end
+			else
+				log("AutoSave: no profiles dirty")
+			end
+		end
+	end)
+end
+
+function PS:_StopAutoLoop()
+	if self._autoCoro then
+		task.cancel(self._autoCoro)
+		self._autoCoro = nil
+		log("AutoSave loop stopped")
+	end
+end
+
+function PS:_FinRelease(prof)
+	local k = prof.Key
+	log("Finalizing release:", k)
+	self._autoLock:Acquire()
+	for i = #self._autoList, 1, -1 do
+		if self._autoList[i] == prof then
+			table.remove(self._autoList, i)
+			log("Removed from auto list:", prof:Id())
+			break
+		end
+	end
+	self._autoLock:Release()
+	self.LoadedProfiles[k] = nil
+	self._profPlayerMap[prof] = nil
+	self.ProfileReleased:Fire(k)
+	log("Profile fully released:", k)
+end
+
+function PS:WipeAsync(key)
+	local k = sanitizeKey(key)
+	assert(k, "Key sanitation failed")
+	warn("WipeAsync requested:", k)
+	if self.LoadedProfiles[k] then
+		self.IssueSignal:Fire("WipeActiveError", "Active profile wipe", self.StoreName, k)
+		return false
+	end
+	local ok, err = self:_CallDS("RemoveAsync", k)
+	if ok then
+		log("Profile wiped:", k)
+		return true
+	else
+		warn("Wipe failed:", k)
+		return false
+	end
+end
+
+function PS:RelStore()
+	log("Releasing store:", self.StoreName)
+	self:_StopAutoLoop()
+	local toRel = {}
+	for _, prof in pairs(self.LoadedProfiles) do
+		if prof:IsActive() then table.insert(toRel, prof) end
+	end
+	for _, prof in ipairs(toRel) do prof:Release(true) end
+	local start = os.clock()
+	while os.clock() - start < 5 do
+		local rem = 0
+		for _, prof in ipairs(toRel) do
+			if prof._saving or self.LoadedProfiles[prof.Key] then
+				rem = rem + 1
+			end
+		end
+		if rem == 0 then break end
+		task.wait(0.2)
+	end
+	self.IssueSignal:Destroy()
+	self.ProfileLoaded:Destroy()
+	self.ProfileLoadFailed:Destroy()
+	self.ProfileSaved:Destroy()
+	self.ProfileSaveFailed:Destroy()
+	self.ProfileReleased:Destroy()
+	log("Store released:", self.StoreName)
+end
+
+local CPS = {
+	ServiceName = "CPS_Optimized_Final",
+	_stores = {},
+	_locked = false,
+	IssueSignal = Sig.new(),
+	CriticalStateSignal = Sig.new(),
+}
+
+function CPS.GetStore(name, def, scope, ver)
+	assert(type(name) == "string" and name ~= "", "name must be non-empty")
+	assert(type(def) == "table", "def must be table")
+	local key = (scope or "global") .. "/" .. name
+	if CPS._stores[key] then
+		local exist = CPS._stores[key]
+		if exist.DefaultData ~= def then warn("DefaultData changed:", key) end
+		if exist.SchemaVersion ~= (ver or 1) then warn("SchemaVersion changed:", key) end
+		return exist
+	end
+	if CPS._locked then
+		warn("Service locked, no new stores:", key)
+		return nil
+	end
+	log("Creating store:", key)
+	local store = PS._new(CPS, name, def, scope, ver)
+	CPS._stores[key] = store
+	store.IssueSignal:Connect(function(...) CPS.IssueSignal:Fire(...) end)
+	return store
+end
+
+function CPS:RelAll()
+	if self._locked then return end
+	log("Releasing all stores...")
+	self._locked = true
+	local toRel = {}
+	for _, store in pairs(self._stores) do
+		table.insert(toRel, store)
+	end
+	self._stores = {}
+	for _, store in ipairs(toRel) do store:RelStore() end
+	self.IssueSignal:Destroy()
+	self.CriticalStateSignal:Destroy()
+end
+
+function CPS.IsLive()
+	return not RS:IsStudio()
+end
+
+function CPS._Init()
+	if CPS._inited then return end
+	log("CPS initializing...")
+	game:BindToClose(function()
+		CPS._Init()
+		for _, store in pairs(CPS._stores) do
+			for _, prof in pairs(store.LoadedProfiles) do
+				if prof.MetaData.ActiveSession then
+					prof.MetaData.ActiveSession = nil
+				end
+			end
+			store:_StopAutoLoop()
+			for _, prof in pairs(store.LoadedProfiles) do
+				store:_EnqSave(prof, true, 0)
+			end
+		end
+		task.wait(1)
+	end)
+	CPS._inited = true
+	log("CPS initialized")
+end
+
+CPS._Init()
+return CPS
