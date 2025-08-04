@@ -112,7 +112,7 @@ local function sanitizeKey(key)
 	return key
 end
 
-local CRYPT_KEY = "asd12e1YGHUIEd2G1`2vj121dF2dgd8123"
+local CRYPT_KEY = "1972" --(?)
 
 local function xorCrypt(data, key)
 	local out = {}
